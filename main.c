@@ -97,8 +97,8 @@
 
 //#include "lib_rc.h"
 
-#define PORT_OUT_SETUP(a,b) P1OUT &= ~(a);
-#define PORT_IN__SETUP(a,b) P1OUT |= (a);
+#define PORT_CLR	(a,b) a &= ~(b)
+#define PORT_SET 	(a,b) a |= (b)
 #define PORT(a,b) 	((b=0)?(P1OUT &= ~(a)):(P1OUT |= (a)))
 #define LED_TOG
 #define LED__ON
@@ -120,7 +120,8 @@
 #define PWM_3		70*SKALA
 
 #define	PWM_PLUS	2*SKALA
-#define PWM_MINU	4*SKALA
+#define PWM_MINU	-4*SKALA
+
 
 // definicje do zegara
 #define PWM_TAKTA	128		// Cykl w trybie LPM3 przy zegarze ACLK = 32768Hz
@@ -128,38 +129,64 @@
 #define CLK_100U	100		// 100us (10kHz) Cykl w trybie normalnym przy zegarze SMCLK = 1MHz
 
 // Tryby pracy
-enum
+enum eOPmodeT
 {
 	eInit,					// co po wlaczeniu
 	eOperation,				// oczekiwanie na IR kod lub przycisk
 	eInterrupt,				// przerywanie IR kod
 	eOdbior,				// interpretacja komendy
 	eNauka,					// nauka / logika
+	eSave,					// zapis nowej komendy
 	eUspienie,				// pauza
-} OPmode;
+}eOPmode;
 
 
-enum
+enum eIR_rcvStateT
 {
 	eStart,
 	eAdress,
 	eKomenda,
-	eStop
-} IR_recState;
+	eStop,
+	eKoniec,
+} eIR_rcvState;
 
 // Zmienne globalne
-int CommandCode[4];			// buffer for command
-int CommandNew;
+int CommandCode[4];			// bufor do odbioru komendy
+int CommandBit;				// ktory bit komendy
+int CommandNew;				// informacja o odebranej nowej komendzie
 
-int PWMwyjscie;				// stan
-int PWMwyjscieNowe;
+int PWMwyjscie;				// stan wyjscia 16bit
+int PWMwyjscieN;			// nowy (docelowy) stan wyjscia po odebraniu komendy
 
 int LED_Kod;
 
-int NaukaLicznik;
-int NaukaOstatniStan;
+int rcvLicznikC;			// Licznik calkowity mierzacy ciagle od poczatku komendy
+int rcvLicznikO;			// ostatni stan licznika calkowitego
+int rcvLicznik;				// Licznik do mierzenia dlugosci bitu
+int rcvPortOst;				// Ostatni stan portu do wykrycia zmiany stanu
 
+int TablicaKomendSzukaj[]={0,0,1,2,3,4};	// Tablica do poszukiwania komendy
+int ii,jj;					// zmienne pomocnicze
 
+//! czasy w komendzie w jednostce 100us
+static const int dlugosc_start = 30;		// dlugosc_1 - start
+static const int dlugosc_1 = 9;		 		// dlugosc_2 - dlugi bit = 1
+static const int dlugosc_0 = 5;				// dlugosc_3 - krotki bit = 0
+static const int dlugosc_pauza = 10;		// dlugosc_4 - pauza
+static const int dlugosc_koniec = 10;		// dlugosc_5 - koniec komendy
+static const int dlugosc_blad = 300;		// dlugosc_6 - blad, przerwanie odbioru
+static const int dlugosc_komenda = 48;		// dlugosc_7 - ilosc bitow komendy musi byc mniejsza niz 64
+
+//! blok modyfikacji wyjscia
+static const int TablicaPWM[] = {
+		PWM_1,
+		PWM_2,
+		PWM_3,
+		PWM_PLUS,
+		PWM_MINU
+};
+
+//! blok w pamieci ktory bedzie nadpisany przy zapamietaniu nowej komendy
 static const int TablicaKomend[][]={
 	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_1
 	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_2
@@ -167,6 +194,9 @@ static const int TablicaKomend[][]={
 	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_PLUS
 	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_MINUS
 };
+
+
+
 
 
 int main(void) {
@@ -183,7 +213,7 @@ int main(void) {
 	for(;;) {
 		volatile unsigned int i;	// volatile to prevent optimization
 
-		switch (OPmode)
+		switch (eOPmode)
 		{
 		case eInit:
 /*
@@ -196,15 +226,15 @@ int main(void) {
 			BCSCTL1 |= CALBC1_1MHZ;
 			BCSCTL2 &= ~SELS;		  				// SMCLK source
 
-			P1DIR &= ~IR_DATA;						// IRDATA is an input
+			PORT_CLR(P1DIR,IR_DATA);				// IRDATA is an input
 			P1IE = IR_DATA;							// enable interrupts, watching IRDATA for a change
 			P1IES = IR_DATA;						// watch for falling edge change on IRDATA
 
 			P1OUT |= LED | WYJSCIE;					// Set all these HIGH
 			P1DIR |= LED | WYJSCIE;					// Set all these as outputs
-
-			P1DIR &= ~WYJSCIE;                      // P1.0,1 oraz P1.4 maja wyjscie sterowane prosto z zegara
-			P1SEL |= 0x20;                          // P1.6 TA0.1 output
+													// P1.0,1 oraz P1.4 maja wyjscie sterowane prosto z zegara
+			PORT_CLR(P1DIR,WYJSCIE);                // Zerowanie wyjscia
+			PORT_SET(P1SEL,6);                      // P1.6 funkcja (TA0.1 output) aktywna (SET)
 
 			// Ustawienie Zegara
 			//TACTL = TASSEL_1 + MC_1				// ACLK 32768 Hz, up mode
@@ -214,7 +244,7 @@ int main(void) {
 			// koniec inicjalizacji
 
 			PWMwyjscie = PWM_1;
-			OPmode = eOperation;
+			eOPmode = eOperation;
 			CCR1 = PWMwyjscie;						// Ustawienie wyjscia
 
 			__bis_SR_register(LPM0_bits + GIE);     // Enter LPM0 w/ interrupt SMCLK
@@ -225,12 +255,18 @@ int main(void) {
 		case eInterrupt:
 /*
  *  przerwanie z portu:
- *  	ustawienie timera na 100us
- *  	zmienna odbior komendy
+ *  - ustawienie timera na 100us
+ *  - zmienna odbior komendy
+ *
+ *	kasowanie zmiennych: Liczniki, bufor odbioru
  *
  */
-			NaukaLicznik = 0;
-			NaukaOstatniStan = 0;
+			rcvLicznikC = 0;
+			rcvLicznikO = rcvLicznikC;
+			rcvLicznik = 0;
+			rcvPortOst = 1;
+
+			eIR_rcvState = eStart;
 
 			CommandNew = 0;
 			CommandCode [0]=0;
@@ -238,38 +274,103 @@ int main(void) {
 			CommandCode [2]=0;
 			CommandCode [3]=0;
 
-			OPmode = eOperation;
-
+			eOPmode = eOdbior;
 			break;
 
 		case eOdbior:
 /*
- *  odbior komendy
- *  	rozpoznanie bit start / stop
- *  		rozpoznanie dlugosci
+ *  odbior komendy:
  *
- *  	rozpoznanie bitu komendy
- *  		stanu 1/0
- *  		zapamietanie bitu
+ *  w petli:
+ *  nowy stan licznika? tak, inkrementowac licznik i dalej : nie, czekac,
+ *  rozpoznanie bitu, nowy stan? tak, dalej : nie, czekac
+ *  	zapamietanie nowego stanu portu
+ *  	ocena dlugosci stanu (rozpoznanie bitu)
+ *  	dlugosc_1 - start
+ *  	dlugosc_2 - dlugi bit = 1
+ *  	dlugosc_3 - krotki bit = 0
+ *  	dlugosc_4 - pauza
+ *  	dlugosc_5 - koniec komendy
+ *  	dlugosc_6 - blad, przerwanie odbioru
+ *  kasowanie licznika bitu
  *
- *  	przerwanie komendy
- *  		licznik przekroczony gdy stan portu wysoki
+ *  zapamietanie bitu komendy
  *
- *  	przetworzenie komendy (porownanie ze znanymi komendami)
- *  		zapamietanie
- *  		zmiana stanu wyjscia / PWM
- *  		blink
+ *  przetworzenie komendy (porownanie ze znanymi komendami)
+ *
+ *  zapamietanie
+ *  zmiana stanu wyjscia / PWM
+ *  blink
  *
  *
  */
-			 if(CommandNew!=0)
-			{
-				OPmode = OPERATION;
-				switch (CommandCode[0])
-				{
-				case 0x8000:
-					break;
-				case
+			if(rcvLicznikO != rcvLicznikC)
+			{	// nowy stan licznika,
+				rcvLicznik++;
+				if ((rcvPortOst != 0) && !(P1IN & IR_DATA))
+				{// rozpoznanie bitu, nowy stan = 0? tak, dalej : nie, czekac na 0
+
+					// nowa komenda / pierwszy bit ? tak, czekaj na nastepny : nie, odbior komendy
+					if (eIR_rcvState == eStart)
+					{
+						eIR_rcvState = eKomenda;
+					}
+					else
+					{  // zapamietanie bitu komendy
+
+						if ((rcvLicznik > dlugosc_0) && (rcvLicznik < dlugosc_1))
+						{ // jedynka
+							CommandCode[CommandBit%16] <<= 1;
+							CommandCode[CommandBit%16]++;
+						}
+						else
+						{ // zero
+						}
+						CommandBit++;
+
+						if (CommandBit == 63)
+						{	// bufor pelny / blad
+							eIR_rcvState = eStop;
+						}
+					}
+					rcvLicznik=0;				// kasowanie licznika
+				}
+
+				if (rcvLicznik >= dlugosc_blad)
+					//eOPmode = eOperation;		// za dlugo / blad
+					eIR_rcvState = eStop;		// za dlugo koniec odbioru / blad
+
+				rcvPortOst = P1IN & IR_DATA;	// zapamietanie aktualnego stanu portu
+
+				if (eIR_rcvState == eStop)
+				{ // nowa komenda; porownanie ze znanymi komendami
+
+					TablicaKomendSzukaj[0]=CommandNew;
+
+					for(ii=0; ii < sizeof(TablicaKomendSzukaj); ii++)
+					{
+						for(jj=0; jj<4; jj++)
+						{
+							if (CommandCode[jj]!=TablicaKomend[ii][jj])
+								break;
+						}
+						if (jj=4)
+						{	// komenda znalezina (ii)
+							eIR_rcvState = eKoniec;
+							ii = sizeof(TablicaKomendSzukaj);
+
+							if (ii<3)
+							{	// wartosci predefiniowane
+								PWMwyjscieN = TablicaPWM[ii];
+							}
+							else
+							{	// wartosci modyfikowane + / -
+								PWMwyjscieN = PWMwyjscie+TablicaPWM[ii];
+							}
+						}
+					}
+
+					eOPmode = eOperation;		// nowa komenda przetworzona
 				}
 			}
 			break;
@@ -289,6 +390,7 @@ int main(void) {
  *
  *  - Fade IN/OUT
  *
+ *	- skalowanie wyjscia
  */
 
 
@@ -333,8 +435,9 @@ int main(void) {
 
 
 /*
- *	przerwanie uzywane do sterowania PWM; wyrzucane jesli stan licznika TAR jest rowny Rejestrowi CCR0=TAR
- *	Odmierzanie cyklu
+ *	przerwanie uzywane do sterowania PWM;
+ *	przerwanie wywolane jesli stan licznika TAR jest rowny Rejestrowi CCR0=TAR (koniec cyklu)
+ *	licznik bignie dalej od 0, port przelaczyc na stan wysoki
  *
  */
 
@@ -348,14 +451,15 @@ void __attribute__ ((interrupt(TIMERA0_VECTOR))) Timer_A0 (void)
 #error Compiler not supported!
 #endif
 {
-											// OPmode = eOperation;
+											// eOPmode = eOperation;
 	PORT(WYJSCIE,1);						// przerzucanie stanu portu 0 -> 1
-
+	rcvLicznikC++;							// inkrementacja glownego licznika
 }
 
 /*
- *	przerwanie uzywane do sterowania PWM; wyrzucane jesli stan licznika TAR jest rowny Rejestrowi CCR0=TAR
- *	Odmierzanie wypelnienia (duty cycle)
+ *	przerwanie uzywane do sterowania PWM;
+ *	przerwanie wywolane jesli stan licznika TAR jest rowny Rejestrowi CCR1=TAR (regulacja wypelnienia PWM)
+ *	licznik bignie dalej
  *
  */
 
@@ -381,10 +485,11 @@ void __attribute__ ((interrupt(TIMERA1_VECTOR))) Timer_A1 (void)
 
 /*
  *  przerwanie z portu:
- *  	wylaczenie przerywania z portu
- *  	ustawienie timera na 100us
- *  	zmienna odbior komendy
- *  	kasowanie zmiennych
+ *  wylaczenie przerywania z portu
+ *  ustawienie timera na 100us
+ *
+ *  kasowanie zmiennych
+ *  przejscie w tryb
  */
 
 #pragma vector = PORT1_VECTOR;
@@ -401,7 +506,7 @@ void __interrupt Port_1(void)
 	TACCR0 &= ~CCIFG;				// clear any pending timerA interrrupt flags
 	TACTL |= MC_1;					// start the timer in UP mode
 */
-	OPmode = eInterrupt;
+	eOPmode = eInterrupt;
 
 }
 
