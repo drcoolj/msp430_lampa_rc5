@@ -1,7 +1,7 @@
 /**
  * \file main.c
  *
- *  Created on: 02.10.2014
+ *  Created on: 22.02.2015
  *      Author: Jacek
  *
  *
@@ -12,19 +12,17 @@
  *  	zegar zewn
  *
  *  - Porty
- *  	Port PWM sterowany sprzetowo zegarem PWM OUT
- *  	Port blink
- *  	Port wejscia
- *
- *  - wyjscie PIN
- *  - Zegar PWM port ->
+ *  	Port OUT 1.6 PWM sterowany sprzetowo zegarem PWM OUT / programowo przez Timer A1
+ *  	Port OUT 1.0 blink
+ *  	Port  IN 1.4 wejscia IR
  *
  *
  *  Logika:
  *  Uruchomienie / Inicjalizacja
  *  - inicjalizacja portow
  *  - po wlaczeniu ustawienie domyslnego wyjscia
- *  - przejscie w tryb Pracy
+ *  - przejscie w tryb uspienia / Pracy i oczekiwania na przerwanie (odbior komendy / przycisku nauka)
+ *  - Po przerwaniu z portu IR -> odbior komandy
  *
  *
  *  Praca:
@@ -38,7 +36,7 @@
  *  			70		2		69		70
  *  			70		2		<=68	68
  *
- *  - Fade IN/OUT
+ *  - Fade IN/OUT -> zbyteczne
  *
  *  przerwanie z portu:
  *  	ustawienie timera na 100us
@@ -74,108 +72,201 @@
  *  - wlaczenie trybu niskiego poboru mocy
  *  procesor nie ma pamieci. Tryb poboru niskiej mocy zeby 1 dzien pamietal w ram.
  *
- *
- *
- * Tablica Stanow	Przejscie	nastepny	Timer	CCR0	CCR1		Skala	INT	LED	Watchdog
-	eInit,			-			OP			SM		-							OFF	1x
-	eOperation,		INT						A		128		PWMwyjscie			ON	-
-	eInterrupt,		-			ODBIOR		SM1MHz	1000	-					ON	-
-	eOdbior,		INT			OP
-	eNauka,			INT
-	eUspienie,		INT			OP
-
-
-	Timery
-	- CCR0 dziala na P1.1
-
  */
 
+/* todo AAA synchronizacja czasow (nowy pilot), zapamietanie nowych czasow
+ * - synchronizacja czasow (nowy pilot), zapamietanie nowych czasow
+ * + sprawdzic dlugosc petli systemowej ~800 tikow
+ * + debug -> do pamieci ile trwaly kolejne sygnaly
+ * - fade in / out -> zbyteczne ?
+ * + nieliniowa skala (kwadratowa)
+ * - polowa (1/3?) czestotliwosci dla krotkich PWM
+ * + min-max: brak przerywan ponizej progu minimalnego (dodatkowy tryb) oraz powyzej maksymalnego
+ * - Praca z kwarca ???
+ * - tryb uspienia LPM ???
+ *
+*/
 
 
-//#include "msp430g2231.h"
-#include "msp430g2452.h"
+#include "msp430g2231.h"
+//#include "msp430g2452.h"
 
 //#include "lib_rc.h"
 
-#define PORT_CLR	(a,b) a &= ~(b)
-#define PORT_SET 	(a,b) a |= (b)
-#define PORT(a,b) 	((b=0)?(P1OUT &= ~(a)):(P1OUT |= (a)))
+#define PORT_CLR(a,b) 	a &= ~(b)
+#define PORT_SET(a,b) 	a |= (b)
+#define PORT(a,b) 	((b>0)?(P1OUT |= a):(P1OUT &= ~a))
 #define LED_TOG
 #define LED__ON
 #define LED_OFF
 
 // wejscia wyjscia
 #define LED			BIT0	// LED czerwony port 1.0
-
 #define WYJSCIE		BIT6	// PWM port 1.6
-#define IR_DATA		BIT4	// wejscei IR port 1.4
 
-// Predef Mocy
-#define PWM_MAX		0xFFFF
-#define PWM_MIN		2*SKALA
-#define SKALA		(PWM_MAX/100)
+#define IR_DATA		BIT4	// wejscie IR port 1.4
+#define SW_NAUKA	BIT3	// wejscie Przyciska nauka port 1.3
 
-#define PWM_1		10*SKALA
-#define PWM_2		40*SKALA
-#define PWM_3		70*SKALA
+// Predef Mocy max = 250 / 1000
+#define PWM_MAX		250
+#define SKALA		PWM_MAX/100
+#define PWM_MIN		10
 
-#define	PWM_PLUS	2*SKALA
-#define PWM_MINU	-4*SKALA
+#define PWM_1		20*SKALA
+#define PWM_2		60*SKALA
+#define PWM_3		90*SKALA
+
+#define	PWM_PLUS	4*SKALA
+#define PWM_MINU	-2*SKALA
+
+
 
 
 // definicje do zegara
-#define PWM_TAKTA	128		// Cykl w trybie LPM3 przy zegarze ACLK = 32768Hz
-#define PWM_TAKTS	512		// Cykl w trybie normalnym / LPM0 przy zegarze SMCLK = 1MHz
-#define CLK_100U	100		// 100us (10kHz) Cykl w trybie normalnym przy zegarze SMCLK = 1MHz
+#define MHZ21		0   //  MHZ16		1
+
+#define MHZ			1000000u
+#define CLK_A		32768			// Cykl w trybie LPM3 przy zegarze ACLK = 32768Hz
+
+#if MHZ21
+#define CLK_S		21				// Cykl w trybie normalnym / LPM0 przy zegarze SMCLK = 21MHz
+#else
+#define CLK_S		16*1123			// Cykl w trybie normalnym / LPM0 przy zegarze SMCLK = 16MHz / DCO=6, RSEL=F 17968
+#endif
+
+//#define CLK_MAIN	CLK_S*MHZ			// glowny zegar
+
+#define CLK_NAUKA	 100			// zegar us (skorygowany) (zegarek oraz 100 blink przez )
+#define CLK_LOOP	1000			// wybrany zegar w mikrosek
+
+#define CLK_LOOP_SET(a) (a==CLK_NAUKA)?(CLK_S/10):(CLK_S)
+
+// liniowa skala
+// #define PWM(a)		(a>PWM_MAX)?(PWM_MAX*CLK_S):((a*a)*CLK_S)
+// #define PWM_NAUKA(a)	(a>>3)*CLK_S 					/* przeliczanie dla trybu nauki (timer 100us */
+
+// nieliniowa skala
+// wejscie 0-255; wyjscie
+#if MHZ21
+#define PWM(a)			(a>PWM_MAX)?(((PWM_MAX*PWM_MAX)/64)*CLK_S):(((a*a)>>6)*CLK_S) //
+#define PWM_NAUKA(a)	(a>PWM_MAX)?(PWM_MAX*PWM_MAX):((a*a)>>5)	/* przeliczanie dla trybu nauki (timer 100us 21MHz */
+#else
+#define PWM(a)			(a>PWM_MAX)?(((PWM_MAX*PWM_MAX)/4)):(((a*a)>>2)) //
+#define PWM_NAUKA(a)	(a>PWM_MAX)?(PWM_MAX*PWM_MAX):((a*a)>>5)	/* przeliczanie dla trybu nauki (timer 100us 16MHz */
+#endif
+//#define PWM(a)		((a*CLK_LOOP*CLK_S)/PWM_MAX)
+//#define PWM_NAUKA(a) 	((a*CLK_NAUKA*CLK_S)/PWM_MAX)
+
+#define KALIBRACJA_PILOTA 0
+#define TEST 1
+
+#if TEST == 0
+#define USPIENIE 1
+#define DEBUG_BLINK_ON
+#define DEBUG_BLINK_OFF
+#define DEBUG_KOMENDA 1
+#else
+#define USPIENIE 0
+#define DEBUG_BLINK_ON(a)   P1OUT |= a										// debug blink Port 1.1
+#define DEBUG_BLINK_OFF(a)  P1OUT &= ~a										// debug blink
+#define DEBUG_KOMENDA 0
+// tymczasowe
+//static int powtorka;
+static int temp1;
+
+#endif
+
 
 // Tryby pracy
-enum eOPmodeT
+typedef enum
 {
 	eInit,					// co po wlaczeniu
 	eOperation,				// oczekiwanie na IR kod lub przycisk
+	eOperationLoop,				// oczekiwanie na IR kod lub przycisk
 	eInterrupt,				// przerywanie IR kod
 	eOdbior,				// interpretacja komendy
 	eNauka,					// nauka / logika
 	eSave,					// zapis nowej komendy
 	eUspienie,				// pauza
-}eOPmode;
+} eOPmodeT;
+volatile eOPmodeT eOPmode;
 
-
-enum eIR_rcvStateT
+typedef enum
 {
-	eStart,
+	eStart0,
+	eStart1,
+	eStart2,
+	eStart3,
+	eStart4,
+	eStart5,
+	eStartEnd,
 	eAdress,
 	eKomenda,
 	eStop,
 	eKoniec,
-} eIR_rcvState;
+	eNowa,
+	eBlad,
+} eIR_rcvStateT;
+volatile eIR_rcvStateT eIR_rcvState;
+
 
 // Zmienne globalne
-int CommandCode[4];			// bufor do odbioru komendy
-int CommandBit;				// ktory bit komendy
-int CommandNew;				// informacja o odebranej nowej komendzie
+#define COMMANDBITMAX 	64			// dlugosc_7 - ilosc bitow komendy musi byc mniejsza niz 64
 
-int PWMwyjscie;				// stan wyjscia 16bit
-int PWMwyjscieN;			// nowy (docelowy) stan wyjscia po odebraniu komendy
+// zmienne modyfikowane w przerywaniu
+volatile static char Nauka;			// etapy nauki
+//static int LED_Kod;
+volatile static int blinkToggle;			// etapy nauki
+volatile static int blink;
+volatile static int blinkCnt;
 
-int LED_Kod;
+static volatile int rcvLicznikC;	// Licznik calkowity mierzacy ciagle od poczatku komendy
+static volatile int rcvPortCur;
 
-int rcvLicznikC;			// Licznik calkowity mierzacy ciagle od poczatku komendy
-int rcvLicznikO;			// ostatni stan licznika calkowitego
-int rcvLicznik;				// Licznik do mierzenia dlugosci bitu
-int rcvPortOst;				// Ostatni stan portu do wykrycia zmiany stanu
+//----
+static int CommandCode[COMMANDBITMAX/16];	// bufor do odbioru komendy
+static int CommandBit;				// ktory bit komendy
 
-int TablicaKomendSzukaj[]={0,0,1,2,3,4};	// Tablica do poszukiwania komendy
-int ii,jj;					// zmienne pomocnicze
+volatile int rcvLicznik;				// Licznik do mierzenia dlugosci bitu
+static int rcvLicznikO;				// ostatni stan licznika calkowitego
 
-//! czasy w komendzie w jednostce 100us
-static const int dlugosc_start = 30;		// dlugosc_1 - start
-static const int dlugosc_1 = 9;		 		// dlugosc_2 - dlugi bit = 1
-static const int dlugosc_0 = 5;				// dlugosc_3 - krotki bit = 0
-static const int dlugosc_pauza = 10;		// dlugosc_4 - pauza
-static const int dlugosc_koniec = 10;		// dlugosc_5 - koniec komendy
-static const int dlugosc_blad = 300;		// dlugosc_6 - blad, przerwanie odbioru
-static const int dlugosc_komenda = 48;		// dlugosc_7 - ilosc bitow komendy musi byc mniejsza niz 64
+static int PWMwyjscie;				// stan wyjscia 16bit
+static int PWMwyjscieN;				// nowy (docelowy) stan wyjscia po odebraniu komendy
+
+/*
+  static int TablicaKomendNauka[5][4]={
+	{ 0x0010, 0x3402, 0x4A7C, 0x0000}, // PWM_1
+	{ 0x0010, 0x3400, 0x4174, 0x0000}, // PWM_2
+	{ 0x0010, 0x3400, 0x497C, 0x0000}, // PWM_3
+	{ 0x0010, 0x3400, 0xB084, 0x0000}, // PWM_PLUS
+	{ 0x0010, 0x3402, 0xB284, 0x0000}  // PWM_MINUS
+};
+*/
+static int TablicaKomendNauka[5][4];
+
+
+
+//! czasy w komendzie w jednostce 1us
+static const int dlugosc_start0 = 3440/CLK_NAUKA;		// dlugosc_start0 - nowa transmisja -stan 0
+static const int dlugosc_start1 = 1720/CLK_NAUKA;		// dlugosc_start1 - start stan 1
+static const int dlugosc_bit =  430/CLK_NAUKA;		// dlugosc_bit - marker bitu, stan 0
+static const int dlugosc_1 = 1720/CLK_NAUKA;		// dlugosc_2 - dlugi bit = 1, stan 1; (430+1290)
+static const int dlugosc_0 = 860/CLK_NAUKA;		// dlugosc_3 - krotki bit = 0, stan 1+0; (430+ 430)
+static const int dlugosc_pauza = 1290/CLK_NAUKA;		// dlugosc_4 - pauza, stan 1+0
+static const int dlugosc_blad = 3000/CLK_NAUKA;		// dlugosc_6 - blad, przerwanie odbioru
+static const int dlugosc_korekcja = 400/CLK_NAUKA;		// dlugosc_korekcja blad rozpoznania komendy
+
+//static volatile int dlugosc_start0;		// dlugosc_start0 - nowa transmisja -stan 0
+//static volatile int dlugosc_start1;		// dlugosc_start1 - start stan 1
+//static volatile int dlugosc_bit;			// dlugosc_bit - marker bitu, stan 0
+//static volatile int dlugosc_1;				// dlugosc_2 - dlugi bit = 1, stan 1
+//static volatile int dlugosc_0;				// dlugosc_3 - krotki bit = 0, stan 1
+//static const int dlugosc_pauza 	= 1290/CLK_NAUKA;		// dlugosc_4 - pauza, stan 1
+//static const int dlugosc_blad 	= 60000/CLK_NAUKA;		// dlugosc_6 - blad, przerwanie odbioru
+//static const int dlugosc_korekcja =100/CLK_NAUKA;		// dlugosc_korekcja blad rozpoznania komendy
+
+//static const int dlugosc_koniec = 3000/CLK_NAUKA;		// dlugosc_5 - koniec komendy
+
 
 //! blok modyfikacji wyjscia
 static const int TablicaPWM[] = {
@@ -183,35 +274,102 @@ static const int TablicaPWM[] = {
 		PWM_2,
 		PWM_3,
 		PWM_PLUS,
-		PWM_MINU
+		PWM_MINU,
 };
 
+#pragma DATA_SECTION(TablicaKomend, ".infoD")
 //! blok w pamieci ktory bedzie nadpisany przy zapamietaniu nowej komendy
-static const int TablicaKomend[][]={
-	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_1
-	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_2
-	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_3
-	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_PLUS
-	{ 0x0000, 0x0000, 0x0000, 0x0000}, // PWM_MINUS
+static const int TablicaKomend[5][4]={
+	{ 0x0010, 0x3402, 0x4A7C, 0x0000}, // PWM_1
+	{ 0x0010, 0x3400, 0x4174, 0x0000}, // PWM_2
+	{ 0x0010, 0x3400, 0x497C, 0x0000}, // PWM_3
+	{ 0x0010, 0x3400, 0xB084, 0x0000}, // PWM_PLUS
+	{ 0x0010, 0x3402, 0xB284, 0x0000}  // PWM_MINUS
 };
 
 
 
+void write_FlashSegD (int *Flash_ptr,int *Data, char Length);
 
+//! Initialize the MSP430 clock.
+void msp430_init_dco() {
+
+	if(CALBC1_1MHZ!=0xFF){
+		//Clear DCL for BCL12
+		DCOCTL = 0x00;
+		//Info is intact, use it.
+		BCSCTL1 = CALBC1_1MHZ;
+		DCOCTL = CALDCO_1MHZ;
+	}else{
+		//Info is missing, guess at a good value.
+//		BCSCTL1 = 0x8f;   //CALBC1_16MHZ at 0x10f9
+//		DCOCTL = 0x7f;    //CALDCO_16MHZ at 0x10f8
+
+	}
+#if MHZ21
+	DCOCTL |= 0xE0;							// 21MHz
+	BCSCTL1|= 0x0F;
+#else
+	//DCOCTL |= 0x60;							// ~16,9MHz
+	BCSCTL1|= 0x0F;
+
+#endif
+	BCSCTL2 &= ~SELS;		  				// SMCLK source
+
+
+}
 
 int main(void) {
 
-/*
+//	//static int TablicaKomendSzukaj[]={0,0,1,2,3,4};	// Tablica do poszukiwania komendy
+	int ii,jj;							// zmienne pomocnicze
+	int temp3,temp2;
+
+	/*
 	 * IR Decoder
 	 * Decode and respond to RC5 IR remote control commands, using a TSOP38238SS1V receiver IC
 	 * Copyright: Jerry Pommer <jerry@jerrypommer.com> 2012-12-04
 	 * License: GNU General Public License v3
 */
 	WDTCTL = WDTPW | WDTHOLD;    			// disable watchdog
+	Nauka = 0;
+	PWMwyjscie = PWM_3;
+	blink=1000;                				// P1.0 LED =1 zapalic
+	//blinkToggle=500;						// kalibracja timera
+	eOPmode = eInit;
+	msp430_init_dco();
 
+	memset(TablicaKomendNauka,0,sizeof(TablicaKomendNauka));
+
+//	dlugosc_start0 = 3440/CLK_NAUKA;		// dlugosc_start0 - nowa transmisja -stan 0
+//	dlugosc_start1 = 1720/CLK_NAUKA;		// dlugosc_start1 - start stan 1
+//	dlugosc_bit 	=  430/CLK_NAUKA;		// dlugosc_bit - marker bitu, stan 0
+//	dlugosc_1 		=  860/CLK_NAUKA;		// dlugosc_2 - dlugi bit = 1, stan 1
+//	dlugosc_0 		=  430/CLK_NAUKA;		// dlugosc_3 - krotki bit = 0, stan 1
+
+//	dlugosc_start0 = 0;		// dlugosc_start0 - nowa transmisja -stan 0
+//	dlugosc_start1 = 0;		// dlugosc_start1 - start stan 1
+//	dlugosc_bit 	=  0;		// dlugosc_bit - marker bitu, stan 0
+//	dlugosc_1 		=  0;		// dlugosc_2 - dlugi bit = 1, stan 1
+//	dlugosc_0 		=  0;		// dlugosc_3 - krotki bit = 0, stan 1
+
+
+//	dlugosc_pauza 	= 1290/CLK_NAUKA;		// dlugosc_4 - pauza, stan 1
+	//static int dlugosc_koniec = 3000/CLK_LOOP;		// dlugosc_5 - koniec komendy
+//	static const int dlugosc_blad 	= 6000/CLK_NAUKA;		// dlugosc_6 - blad, przerwanie odbioru
+//	static const int dlugosc_korekcja =100/CLK_NAUKA;		// dlugosc_korekcja blad rozpoznania komendy
+
+
+	temp1=0;
+	temp3 = TAR;
 
 	for(;;) {
-		volatile unsigned int i;	// volatile to prevent optimization
+		volatile unsigned int i;			// volatile to prevent optimization
+
+		temp2 = TAR-temp3;
+		if(temp2>temp1)
+			temp1=temp2;
+		temp3 = TAR;
 
 		switch (eOPmode)
 		{
@@ -222,33 +380,41 @@ int main(void) {
  *  - po wlaczeniu ustawienie domyslnego wyjscia
  *  - przejscie w tryb Pracy
  */
-			DCOCTL = CALDCO_1MHZ;     				// select DCO approx. 1MHz
-			BCSCTL1 |= CALBC1_1MHZ;
-			BCSCTL2 &= ~SELS;		  				// SMCLK source
 
 			PORT_CLR(P1DIR,IR_DATA);				// IRDATA is an input
-			P1IE = IR_DATA;							// enable interrupts, watching IRDATA for a change
-			P1IES = IR_DATA;						// watch for falling edge change on IRDATA
-
-			P1OUT |= LED | WYJSCIE;					// Set all these HIGH
+			PORT_CLR(P1OUT,LED|WYJSCIE|BIT1|BIT2);	// Set all these LOW
 			P1DIR |= LED | WYJSCIE;					// Set all these as outputs
-													// P1.0,1 oraz P1.4 maja wyjscie sterowane prosto z zegara
-			PORT_CLR(P1DIR,WYJSCIE);                // Zerowanie wyjscia
-			PORT_SET(P1SEL,6);                      // P1.6 funkcja (TA0.1 output) aktywna (SET)
+//			PORT_SET(P1SEL,WYJSCIE);                // P1.6 funkcja, wyjscie zegara, (TA0.1 output) aktywna (SET)
+			PORT_CLR(P1SEL,WYJSCIE);                // P1.6 funkcja, wyjscie zegara, (TA0.1 output) nieaktywna (CLEAR)
+													// Interrupt
+			P1IES |= IR_DATA;						// watch for falling edge change on IRDATA
+			P1IFG 	= 0;							// clear the P1 interrupt flags
+			P1IE = IR_DATA|SW_NAUKA;				// enable interrupts, watching IRDATA and SW_NAUKA for a change
 
 			// Ustawienie Zegara
+			TACTL = TACLR;
 			//TACTL = TASSEL_1 + MC_1				// ACLK 32768 Hz, up mode
 			TACTL = TASSEL_2 + MC_1 + TAIE;			// SMCLK 1MHz, up mode
 			CCTL0 = CCIE;                          	// CCR0 interrupt enabled
-			CCR0 = PWM_TAKT;						// Ustalenie Taktu; licznik liczy od 0 do PWM_TAKT po tym interrupt
+			CCTL1 = CCIE;                         	// CCR1 interrupt enabled
+			CCR0 = CLK_LOOP_SET(CLK_LOOP);			// Ustalenie Taktu; licznik liczy od 0 do PWM_TAKT po tym interrupt
+			CCR1 = PWM(PWMwyjscie);					// Ustawienie wyjscia
+
+// manual / automatycznie
+/*
+ 			P1.0,1 oraz P1.4 maja wyjscie sterowane prosto z zegara jesli SEL = 1
+			PORT_CLR(P1DIR,WYJSCIE);                // Zerowanie wyjscia
+			PORT_SET(P1SEL,WYJSCIE);                // P1.6 funkcja, wyjscie zegara, (TA0.1 output) aktywna (SET)
+			CCTL1 = OUTMOD_7;                       // CCR1 reset/set
+			CCTL0 &= ~CCIE;                         // CCR0 interrupt enabled
+			CCTL1 &= ~CCIE;                         // CCR1 interrupt enabled
+*/
+
+			__bis_SR_register(GIE);					// interrupts enabled
+
 			// koniec inicjalizacji
-
-			PWMwyjscie = PWM_1;
-			eOPmode = eOperation;
-			CCR1 = PWMwyjscie;						// Ustawienie wyjscia
-
-			__bis_SR_register(LPM0_bits + GIE);     // Enter LPM0 w/ interrupt SMCLK
-			// __bis_SR_register(LPM3_bits + GIE);  // Enter LPM3 w/ interrupt ACLK
+			eOPmode = eUspienie;
+			eIR_rcvState = eStart0;
 
 			break;
 
@@ -262,19 +428,29 @@ int main(void) {
  *
  */
 			rcvLicznikC = 0;
-			rcvLicznikO = rcvLicznikC;
+			rcvLicznikO = 0;
 			rcvLicznik = 0;
-			rcvPortOst = 1;
+			rcvPortCur = 1;
 
-			eIR_rcvState = eStart;
-
-			CommandNew = 0;
 			CommandCode [0]=0;
 			CommandCode [1]=0;
 			CommandCode [2]=0;
 			CommandCode [3]=0;
+			CommandBit = 0;
 
 			eOPmode = eOdbior;
+
+			// Ustawienie Zegara
+			TACTL = TACLR;
+			//TACTL = TASSEL_1 + MC_1				// ACLK 32768 Hz, up mode
+			TACTL = TASSEL_2 + MC_1 + TAIE;		// SMCLK 1MHz, up mode
+			//CCTL0 = CCIE;                         // CCR0 interrupt enabled
+
+			CCR0 = CLK_LOOP_SET(CLK_NAUKA);			// Ustalenie Taktu; licznik liczy od 0 do CLK_NAUKA po tym interrupt
+			CCR1 = PWM_NAUKA(PWMwyjscie);
+//			CCTL1 &= ~CCIE;                         // CCR1 interrupt disabled
+
+			// powtorka = 0;
 			break;
 
 		case eOdbior:
@@ -304,74 +480,176 @@ int main(void) {
  *
  *
  */
-			if(rcvLicznikO != rcvLicznikC)
-			{	// nowy stan licznika,
-				rcvLicznik++;
-				if ((rcvPortOst != 0) && !(P1IN & IR_DATA))
-				{// rozpoznanie bitu, nowy stan = 0? tak, dalej : nie, czekac na 0
+//			rcvLicznikO -= rcvLicznikC;
+			if((rcvLicznikC - rcvLicznikO) != 0)
+			{	// nowy stan licznika calkowitego -> znaczy minelo X razy CLK_NAUKA us,
 
-					// nowa komenda / pierwszy bit ? tak, czekaj na nastepny : nie, odbior komendy
-					if (eIR_rcvState == eStart)
-					{
-						eIR_rcvState = eKomenda;
+				rcvLicznik += rcvLicznikC - rcvLicznikO;							// inkrementacja licznika czasu odbioru
+				// rcvPortCur zerowane po przerwaniu
+//				rcvPortCur = P1IN & IR_DATA;
+
+				// ---- Debug
+//				if ((rcvPortOst == 0) && (0 != rcvPortCur)) {
+//					CommandCode [0] += 1;
+//					DEBUG_BLINK_OFF(BIT0);
+//				}
+//				else
+//				{
+//					DEBUG_BLINK_ON(BIT0);
+//				}
+
+//				CommandCode [0] <<= -rcvLicznikO;
+				// ---- Debug
+
+				switch (eIR_rcvState)
+				{
+/*
+				case eStart0:
+					if (rcvPortOst == 0) {
+					if (rcvPortCur)
+					{// rozpoznanie bitu startu, nowy stan = 1? tak, dalej : nie, czekac na 1
+						DEBUG_BLINK_ON(BIT0);
+//						if ((rcvLicznik > dlugosc_start0-dlugosc_korekcja) && (rcvLicznik < dlugosc_start0+dlugosc_korekcja))
+						{
+							dlugosc_start0 = rcvLicznik;
+							eIR_rcvState = eStart1; 				// Bit Startu odebrany; stan niski OK
+							rcvLicznik=0;							// kasowanie licznika
+						}
+					}}
+					break;
+				case eStart1:
+					if ((rcvPortOst != 0) && !(rcvPortCur))
+					{// rozpoznanie bitu startu, nowy stan = 0? tak, dalej : nie, czekac na 0
+//						if ((rcvLicznik > dlugosc_start1-dlugosc_korekcja) && (rcvLicznik < dlugosc_start1+dlugosc_korekcja))
+						{
+							dlugosc_start1 = rcvLicznik;
+							eIR_rcvState = eKomenda; 				// Bit Startu odebrany; stan wysoki OK
+							rcvLicznik=0;							// kasowanie licznika
+						}
 					}
-					else
-					{  // zapamietanie bitu komendy
+					break;
+*/
+				case eStartEnd:
+					eIR_rcvState = eKomenda; 				// Bit Startu odebrany; stan wysoki OK
+					rcvLicznik=1;							// kasowanie licznika
+					break;
 
-						if ((rcvLicznik > dlugosc_0) && (rcvLicznik < dlugosc_1))
+				case eKomenda:
+					if (!(rcvPortCur)) {
+						// rozpoznanie bitu, nowy stan = 0? tak, dalej : nie, czekac na 0
+						// zapamietanie bitu komendy
+//						DEBUG_BLINK_ON(BIT0);
+
+						if ((rcvLicznik >= dlugosc_0-dlugosc_korekcja) && (rcvLicznik < dlugosc_0+dlugosc_korekcja))
+						{ // zero
+							CommandCode[CommandBit>>4] <<= 1;
+							CommandBit++;
+						}
+						else if ((rcvLicznik >= dlugosc_1-dlugosc_korekcja) && (rcvLicznik < dlugosc_1+dlugosc_korekcja))
 						{ // jedynka
-							CommandCode[CommandBit%16] <<= 1;
-							CommandCode[CommandBit%16]++;
+							CommandCode[CommandBit>>4] = CommandCode[CommandBit>>4] << 1;
+							CommandBit++;
+							CommandCode[CommandBit>>4]++;
 						}
 						else
-						{ // zero
+						{ // pauza
+							// powtorka++;
 						}
-						CommandBit++;
 
-						if (CommandBit == 63)
+						if (CommandBit == COMMANDBITMAX-1)
 						{	// bufor pelny / blad
 							eIR_rcvState = eStop;
 						}
+
+						// tylko w celu debugowania
+#if DEBUG_KOMENDA
+						CommandBit--;
+						TablicaKomendNauka[CommandBit>>4][0x0003&(CommandBit>>2)] = TablicaKomendNauka[CommandBit>>4][0x0003&(CommandBit>>2)] << 4;
+						TablicaKomendNauka[CommandBit>>4][0x0003&(CommandBit>>2)] += rcvLicznik>>3;
+						CommandBit++;
+#endif
+
+						rcvLicznik=1;						// kasowanie licznika impulsow
+						rcvPortCur = 1;						// zapamietanie aktualnego stanu portu
+						P1IE |= IR_DATA;					// Turn on P1 interrupts while we work
 					}
-					rcvLicznik=0;				// kasowanie licznika
-				}
+					else{	// odbierany jest stan niski
+						if (rcvLicznik >= dlugosc_blad)
+							//eOPmode = eOperation;		// za dlugo / blad
+							eIR_rcvState = eStop;		// za dlugo koniec odbioru / blad
+//							DEBUG_BLINK_OFF(BIT0);
+						}
+					break;
 
-				if (rcvLicznik >= dlugosc_blad)
-					//eOPmode = eOperation;		// za dlugo / blad
-					eIR_rcvState = eStop;		// za dlugo koniec odbioru / blad
+				case eStop:
+				case eKoniec:
+					// nowa komenda; porownanie ze znanymi komendami
 
-				rcvPortOst = P1IN & IR_DATA;	// zapamietanie aktualnego stanu portu
+					// tylko w celu debugowania
+					CommandCode[CommandBit>>4] <<=  16 * (1+ (CommandBit>>4))- CommandBit;
+					TablicaKomendNauka[CommandBit>>4][0x0003&(CommandBit>>2)] <<= 4 * (16 * (1+ (CommandBit>>4))- CommandBit);
 
-				if (eIR_rcvState == eStop)
-				{ // nowa komenda; porownanie ze znanymi komendami
-
-					TablicaKomendSzukaj[0]=CommandNew;
-
-					for(ii=0; ii < sizeof(TablicaKomendSzukaj); ii++)
+					if (Nauka != 0)
 					{
-						for(jj=0; jj<4; jj++)
-						{
-							if (CommandCode[jj]!=TablicaKomend[ii][jj])
-								break;
-						}
-						if (jj=4)
-						{	// komenda znalezina (ii)
-							eIR_rcvState = eKoniec;
-							ii = sizeof(TablicaKomendSzukaj);
+						eIR_rcvState = eKoniec;									// tymczasowa zmienna, jesli zostanie zmienione na stop to znaczy nie znana komenda
+						for(ii=0; ii < sizeof(CommandCode)/sizeof(CommandCode[0]); ii++)
+						{	// zapamietanie Komendy
+							if ((Nauka>1) && (CommandCode[ii] != TablicaKomend[Nauka-2][ii]))
+								eIR_rcvState = eStop;							// nie pasuje do znanego musteru -> nowa komenda
 
-							if (ii<3)
-							{	// wartosci predefiniowane
-								PWMwyjscieN = TablicaPWM[ii];
+							TablicaKomendNauka[Nauka-1][ii]=CommandCode[ii];
+						}
+						if ((Nauka>1) && (eIR_rcvState == eKoniec))				// komenda taka sama co ostatnio, zignorowac
+						{
+							Nauka--;
+						}
+						Nauka++;
+						eOPmode = eNauka;
+					}
+					else {
+						PWMwyjscieN = PWMwyjscie;									// bez zmian prosze jesli komenda nierozpoznana
+
+						for(ii=0; ii < sizeof(TablicaKomend)/sizeof(TablicaKomend[0]); ii++)
+						{
+							eIR_rcvState = eKoniec;									// tymczasowa zmienna, jesli zostanie zmienione na stop to znaczy nie znana komenda
+							for(jj=0; jj<sizeof(CommandCode)/sizeof(CommandCode[0]); jj++)
+							{
+								if (CommandCode[jj]!=TablicaKomend[ii][jj])
+									eIR_rcvState = eStop;							// nie pasuje do znanego musteru
 							}
-							else
-							{	// wartosci modyfikowane + / -
-								PWMwyjscieN = PWMwyjscie+TablicaPWM[ii];
+							if (eIR_rcvState == eKoniec)
+							{	// komenda znalezina (ii)
+								// nowe wartosci predefiniowane
+								if (ii<3)
+								{	// wartosci predefiniowane
+									PWMwyjscieN = TablicaPWM[ii];
+								}
+								else
+								{	// wartosci modyfikowane + / -
+									PWMwyjscieN = PWMwyjscie+TablicaPWM[ii];
+									if(PWMwyjscieN < 0) PWMwyjscieN = 0;
+									else if (PWMwyjscieN > PWM_MAX) PWMwyjscieN = PWM_MAX;
+
+								}
+								ii = sizeof(TablicaKomend[0]); 		// koniec poszukiwania
 							}
 						}
+						eOPmode = eOperation;					// nowa komenda przetworzona
 					}
 
-					eOPmode = eOperation;		// nowa komenda przetworzona
+					blink = 100;
+					if(CommandBit<46)
+						blink = 1000;						// bledna komenda
+
+					CCR0 = CLK_LOOP_SET(CLK_LOOP);			// Ustalenie Taktu; licznik liczy od 0 do PWM_TAKT po tym interrupt
+					P1IE = IR_DATA|SW_NAUKA;				// enable interrupts, watching IRDATA and SW_NAUKA for a change
+					break;
+
+				default:
+					break;
 				}
+
+				rcvLicznikO = rcvLicznikC;
 			}
 			break;
 
@@ -394,6 +672,27 @@ int main(void) {
  */
 
 
+			// \Todo fade in/ out
+			PWMwyjscie = PWMwyjscieN;
+
+			// min-max: brak przerywan ponizej progu minimalnego (dodatkowy tryb) oraz powyzej maksymalnego
+			if (PWM_MIN > PWMwyjscie)
+				CCTL1 &= ~CCIE;             // CCR1 interrupt enabled
+			else
+				CCTL1 |= CCIE;              // CCR1 interrupt enabled
+
+			CCR1 = PWM(PWMwyjscie);			// Ustawienie wyjscia
+
+			eOPmode = eUspienie;
+			eIR_rcvState = eStart0;
+			break;
+
+		case eUspienie:
+#if USPIENIE == 1
+			if (blink == 0)
+				__bis_SR_register(CPUOFF + GIE);		// Low Power Mode 0 with interrupts enabled
+
+#endif
 			break;
 
 		case eNauka:
@@ -404,11 +703,36 @@ int main(void) {
  *  	blink
  *
  */
+			eOPmode = eOperation;					// nowa komenda przetworzona
 
-			break;
+			if (Nauka == 1+(sizeof(TablicaPWM)/sizeof(TablicaPWM[0])))
+			{	// nowe kody odebrane
+				write_FlashSegD((int *)TablicaKomend, (int *)TablicaKomendNauka, sizeof(TablicaKomendNauka)/sizeof(int));
 
-		case eUspienie:
-			__bis_SR_register(CPUOFF + GIE);	// Low Power Mode 0 with interrupts enabled
+				// nowa tablica zapamietana
+				memset(TablicaKomendNauka,0,sizeof(TablicaKomendNauka));
+
+				// skasowanie licznika nauki
+				blink = 1000;
+				Nauka = 0;
+				eOPmode = eOperation;				// nowa komenda przetworzona
+			}
+			else
+			{
+//				blink = 100;
+
+				Nauka--;
+				// nowe wartosci predefiniowane
+				if ((Nauka)<3)
+				{	// wartosci predefiniowane
+					PWMwyjscieN = TablicaPWM[Nauka];
+				}
+				else
+				{	// wartosci modyfikowane + / -
+					PWMwyjscieN = PWMwyjscie+TablicaPWM[Nauka];
+				}
+				Nauka++;
+			}
 			break;
 
 		default:
@@ -416,23 +740,66 @@ int main(void) {
 
 		}
 
-/*
-		switch (blink)
-		{
-		case ONE:
-			break;
-		case ONE_SEC:
-			break;
-		default:
-			break;
+		if (blinkCnt != 0) {
+			if (blinkCnt > blink+1)
+			{
+				PORT(LED,1);                // P1.6 LED =1 zapalic
+			}
+			else
+			{
+				PORT(LED,0);                // P1.6 LED =0 zgasic
+			}
+		} else {
+			if (blinkToggle) {
+				blinkCnt = blinkToggle<<1;
+				blink=blinkToggle;
+			} else if (blink)
+			{
+				blinkCnt = blink;
+				blink = 0;
+			}
 		}
-*/
+
 	}
 
 
 	return 0;
 }
 
+
+void write_FlashSegD (int *Flash_ptr, int *Data, char Length)
+{
+//  char *Flash_ptr;       					  // Flash pointer
+	unsigned int i;
+	int temp1,temp2;
+
+    temp1 = BCSCTL1;
+    temp2 = DCOCTL;
+
+    DCOCTL = 0;                               // Select lowest DCOx and MODx settings
+	BCSCTL1 = CALBC1_1MHZ;                    // Set DCO to 1MHz
+	DCOCTL = CALDCO_1MHZ;
+
+	FCTL2 = FWKEY + FSSEL0 + FN1;             // MCLK/3 for Flash Timing Generator
+	FCTL1 = FWKEY + ERASE;                    // Set Erase bit
+	FCTL3 = FWKEY;                            // Clear Lock bit
+
+	*Flash_ptr = 0;                           // Dummy write to erase Flash segment
+
+	FCTL1 = FWKEY + WRT;                      // Set WRT bit for write operation
+
+	for (i=0; i<Length; i++)
+	{
+		*Flash_ptr++ = *Data++;				  // Write value to flash
+	}
+
+	FCTL1 = FWKEY;                            // Clear WRT bit
+	FCTL3 = FWKEY + LOCK;                     // Set LOCK bit
+
+    BCSCTL1 = temp1;
+    DCOCTL = temp2;
+
+}
 
 /*
  *	przerwanie uzywane do sterowania PWM;
@@ -443,7 +810,7 @@ int main(void) {
 
 // Timer A0 interrupt service routine
 #if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
-#pragma vector=TIMERA0_VECTOR
+#pragma vector=TIMER0_A0_VECTOR
 __interrupt void Timer_A0 (void)
 #elif defined(__GNUC__)
 void __attribute__ ((interrupt(TIMERA0_VECTOR))) Timer_A0 (void)
@@ -452,8 +819,13 @@ void __attribute__ ((interrupt(TIMERA0_VECTOR))) Timer_A0 (void)
 #endif
 {
 											// eOPmode = eOperation;
-	PORT(WYJSCIE,1);						// przerzucanie stanu portu 0 -> 1
 	rcvLicznikC++;							// inkrementacja glownego licznika
+	if (blinkCnt)
+		blinkCnt--;
+	if( CCTL1 & CCIE)             			// CCR1 interrupt enabled
+		PORT(WYJSCIE,1);						// przerzucanie stanu portu 0 -> 1
+
+
 }
 
 /*
@@ -465,7 +837,7 @@ void __attribute__ ((interrupt(TIMERA0_VECTOR))) Timer_A0 (void)
 
 // Timer_A2 Interrupt Vector (TAIV) handler
 #if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
-#pragma vector=TIMERA1_VECTOR
+#pragma vector=TIMER0_A1_VECTOR
 __interrupt void Timer_A1(void)
 #elif defined(__GNUC__)
 void __attribute__ ((interrupt(TIMERA1_VECTOR))) Timer_A1 (void)
@@ -483,35 +855,174 @@ void __attribute__ ((interrupt(TIMERA1_VECTOR))) Timer_A1 (void)
 	}
 }
 
-/*
+/*!
  *  przerwanie z portu:
- *  wylaczenie przerywania z portu
- *  ustawienie timera na 100us
- *
- *  kasowanie zmiennych
- *  przejscie w tryb
+ *  1) PORT IR (zbocze opadajace)
+ * *
+ *	2) przycisk
  */
 
 #pragma vector = PORT1_VECTOR;
 void __interrupt Port_1(void)
 {
-	P1IE &= ~IR_DATA;				// Turn off P1 interrupts while we work
-	P1IFG &= ~IR_DATA;				// clear the P1 interrupt flag for IRDATA
+
+#if KALIBRACJA_PILOTA
+	if (IR_DATA & P1IFG)
+	{	// IR port -> przerwanie
+		P1IFG &= ~IR_DATA;							// clear the P1 interrupt flag for IRDATA
+		if (eOPmode == eUspienie)
+			eOPmode = eInterrupt;
+
+		switch (eIR_rcvState)
+		{
+		case eStart0:
+			eIR_rcvState = eStart1; 				// Bit Startu odebrany; stan niski OK
+  			P1IES &= ~IR_DATA;						// now watch for Rising edge change on IRDATA
+  			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+  			break;
+		case eStart1:
+  			dlugosc_start0 = rcvLicznikC;
+			eIR_rcvState = eStart2; 				// Bit Startu odebrany; stan niski OK
+  			P1IES |= IR_DATA;						// now watch for falling edge change on IRDATA
+  			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+			break;
+		case eStart2:
+  			dlugosc_start1 = rcvLicznikC;
+			eIR_rcvState = eStart3; 				// Bit Startu odebrany; stan wysoki OK
+  			P1IES &= ~IR_DATA;						// now watch for Rising edge change on IRDATA
+  			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+			break;
+		case eStart3:
+  			dlugosc_bit = rcvLicznikC;
+			eIR_rcvState = eStart4; 				// Znacznik bitu odebrany (niski)
+  			P1IES |= IR_DATA;						// now watch for falling edge change on IRDATA
+  			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+  			break;
+		case eStart4:
+  			dlugosc_0 = rcvLicznikC; 				// Bit 0 odebrany (wysoki)
+			eIR_rcvState = eStart5; 				//
+  			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+			break;
+		case eStart5:
+  			dlugosc_1 = rcvLicznikC-dlugosc_0; 		// Bit 1 odebrany (wysoki)
+  			dlugosc_0 = dlugosc_0-dlugosc_start1; 		// Bit 0 odebrany (wysoki)
+  			dlugosc_bit = dlugosc_bit-dlugosc_start1;
+  			dlugosc_start1 = dlugosc_start1-dlugosc_start0;
+			eIR_rcvState = eStartEnd; 				//
+  			P1IE &= ~IR_DATA;						// Turn off P1 interrupts while we work
+			break;
+#else
+			if (IR_DATA & P1IFG)
+			{	// IR port -> przerwanie
+				P1IFG &= ~IR_DATA;							// clear the P1 interrupt flag for IRDATA
+				if (eOPmode == eUspienie)
+					eOPmode = eInterrupt;
+
+				switch (eIR_rcvState)
+				{
+				case eStart0:
+					eIR_rcvState = eStart1; 				// Bit Startu odebrany; stan niski OK
+//					break;									// no break
+				case eStart1:
+					eIR_rcvState = eStart2; 				// Bit Startu odebrany; stan niski OK
+					break;
+				case eStart2:
+					eIR_rcvState = eStart3; 				// Bit Startu odebrany; stan wysoki OK
+					break;
+				case eStart3:
+					eIR_rcvState = eStart4; 				// Znacznik bitu odebrany (niski)
+//					break;									// no break
+				case eStart4:
+					eIR_rcvState = eStart5; 				//
+					break;
+				case eStart5:
+					eIR_rcvState = eStartEnd; 				//
+					break;
+#endif
+/*
+					if (IR_DATA & P1IFG)
+					{	// IR port -> przerwanie
+						P1IFG &= ~IR_DATA;							// clear the P1 interrupt flag for IRDATA
+						if (eOPmode == eUspienie)
+							eOPmode = eInterrupt;
+
+						switch (eIR_rcvState)
+						{
+						case eStart0:
+							eIR_rcvState = eStart1; 				// Bit Startu odebrany; stan niski OK
+				//			P1IES &= ~IR_DATA;						// now watch for Rising edge change on IRDATA
+				//			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+				//			break;
+						case eStart1:
+				//			dlugosc_start0 = rcvLicznikC;
+							eIR_rcvState = eStart2; 				// Bit Startu odebrany; stan niski OK
+				//			P1IES |= IR_DATA;						// now watch for falling edge change on IRDATA
+				//			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+							break;
+						case eStart2:
+				//			dlugosc_start1 = rcvLicznikC;
+							eIR_rcvState = eStart3; 				// Bit Startu odebrany; stan wysoki OK
+				//			P1IES &= ~IR_DATA;						// now watch for Rising edge change on IRDATA
+				//			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+							break;
+						case eStart3:
+				//			dlugosc_bit = rcvLicznikC;
+							eIR_rcvState = eStart4; 				// Znacznik bitu odebrany (niski)
+				//			P1IES |= IR_DATA;						// now watch for falling edge change on IRDATA
+				//			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+				//			break;
+						case eStart4:
+				//			dlugosc_0 = rcvLicznikC; 				// Bit 0 odebrany (wysoki)
+							eIR_rcvState = eStart5; 				//
+				//			P1IE |= IR_DATA;						// Turn on P1 interrupts while we work
+							break;
+						case eStart5:
+				//			dlugosc_1 = rcvLicznikC-dlugosc_0; 		// Bit 1 odebrany (wysoki)
+				//			dlugosc_0 = dlugosc_0-dlugosc_start1; 		// Bit 0 odebrany (wysoki)
+				//			dlugosc_bit = dlugosc_bit-dlugosc_start1;
+				//			dlugosc_start1 = dlugosc_start1-dlugosc_start0;
+							eIR_rcvState = eStartEnd; 				//
+				//			P1IE &= ~IR_DATA;						// Turn off P1 interrupts while we work
+							break;
+*/
+		default:
+			//										debug, command processiny by interrupt
+			P1IE &= ~IR_DATA;						// Turn off P1 interrupts while we work
+			rcvPortCur = 0;
+			break;
+		}
+	}
+	else if (SW_NAUKA & P1IFG)
+	{	// przycisk -> Nauka
+		P1IFG &= ~SW_NAUKA;							// clear the P1 interrupt flag for SW_NAUKA
+		if (eOPmode == eUspienie)
+			eOPmode = eNauka;
+		Nauka = 1;
+	}
 
 	//TODO: wait for second start bit within T_INTERVAL; abandon if it doesn't come.
 
-	/*
-	// start timer
-    TACCTL0 |= CCIE;				// enable timer interrupts
-	TACCR0 &= ~CCIFG;				// clear any pending timerA interrrupt flags
-	TACTL |= MC_1;					// start the timer in UP mode
-*/
-	eOPmode = eInterrupt;
 
 }
 
+/**
+\dot
+digraph G {"
+eInit	->	eOperation	;
+eOperation	->	eUspienie	;
+eUspienie	->	eUspienie	;
+eOdbior	->	eOperation	;
+eNauka	->	eOdbior	;
+eInterrupt Timer0	->	PWM_ON	;
+eInterrupt Timer1	->	PWM_OFF	;
+eInterrupt Port IR	->	eOdbior	;
+eInterrupt BUTTON	->	eNauka	;
+"}
+\enddot
+*/
 
-/*
+
+/**
  *
  * TACTL - Timer A Control Register
 
@@ -554,6 +1065,20 @@ PWM Code: Out Modes
 – OUTMOD_6
 – OUTMOD_7: The output is reset when the timer counts to the TACCRx value. It is set when the timer counts to the TACCR0 value.
 • Only worry about OUTMOD_3 and OUTMOD_7
+
+
+http://www.egr.msu.edu/classes/ece480/capstone/fall10/group04/Dong,%20Roy%20-%20Application%20Note.pdf
+
+
+For example, from pg. 6 of the MSP430G2231
+datasheet, pin 4 is “P1.2/TA0.1/A2”. We want to use this pin as “TA0.1”. To do this, we have to set second
+bit of both the P1SEL and P1DIR registers accordingly. Generally, to set the Px.y pin, we must set the
+PxSEL and PxDIR registers accordingly at bit y. A 0 in PxDIR is input; a 1 is output. A 0 in PxSEL means
+general purpose input/output, while a 1 in PxSEL reflects a special purpose based on the pin. For
+example, to use the timer, we would set the appropriate bits in PxSEL and PxDIR to 1. To use the ADC
+converter (A2), we would set PxSEL to 1 and PxDIR to 0. The code to set the pin as a timer is as follows:
+P1DIR |= BIT2;
+P1SEL |= BIT2;
 
 
  *
